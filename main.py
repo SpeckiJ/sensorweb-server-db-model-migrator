@@ -158,14 +158,16 @@ def copy_dataset(name):
                     "fk_platform_id, fk_procedure_id, fk_phenomenon_id, fk_offering_id, fk_category_id) VALUES (" \
                     "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s); "
         target_cursor.execute(statement, (
-            datastream_id, "aggregation", d[1], d[2], d[3], d[14], d[4], d[5], d[6], d[7], d[10], d[11], d[12], d[13],
+            datastream_id, "aggregation", d[3], d[14], d[1], d[2],  d[4], d[5], d[6], d[7], d[10], d[11], d[12], d[13],
             fk_offering, 1
         ))
 
         # link sub-datasets to aggregations
-        target_cursor.execute("SELECT dataset_id FROM public.dataset WHERE sta_identifier = '{}'".format(d[2]))
+        # get id of freshly inserted dataset
+        target_cursor.execute("SELECT dataset_id FROM public.dataset WHERE sta_identifier = '{}'".format(d[14]))
         aggregation_id = target_cursor.fetchone()[0]
 
+        # get all subdatasets
         src_cursor.execute(
             "SELECT fk_dataset_id from public.datastream_dataset where fk_datastream_id = {}".format(d[0]))
         sub_dataset_ids = ",".join([str(x[0]) for x in src_cursor.fetchall()])
@@ -228,7 +230,7 @@ def copy_procedure(name):
 def update_sequences():
     target_cursor = target_conn.cursor()
     for seq in sequences:
-        target_cursor.execute("select max({})+1 from {}".format(seq + "_id", seq))
+        target_cursor.execute("select max({}) from {}".format(seq + "_id", seq))
         val = target_cursor.fetchone()[0]
         if val is None:
             continue
