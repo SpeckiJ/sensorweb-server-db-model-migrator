@@ -1,0 +1,30 @@
+version: "3.4"
+
+services:
+  sta-migrator:
+    image: 52north/sta-migrator:latest
+    environment:
+      SRC_DB: "host=database, dbname=${POSTGRES_DATABASE} user=${POSTGRES_USERNAME} password=${POSTGRES_PASSWORD} port=5432"
+      TARGET_DB: "host=database2, dbname=${POSTGRES_DATABASE} user=${POSTGRES_USERNAME} password=${POSTGRES_PASSWORD} port=5432"
+      DEBUG: "true"
+    depends_on:
+      - database
+      - database2
+
+  database:
+    image: ${REGISTRY}eurofleets/database:latest
+    #build: ./database
+    environment:
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+      POSTGRES_USER: ${POSTGRES_USERNAME}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    #volumes:
+    #  - postgres:/var/lib/postgresql/data
+
+  database2:
+    image: ${REGISTRY}eurofleets/database:new
+    #build: ./database
+    environment:
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+      POSTGRES_USER: ${POSTGRES_USERNAME}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
