@@ -1,6 +1,9 @@
 import os
 import psycopg2 as psycopg
 import io
+import sys
+import traceback
+from tqdm import tqdm
 
 # database connections
 src_conn = None
@@ -26,6 +29,7 @@ def copy_thing_location(name):
 # Copies parameters into their respective tables
 # in
 def copy_parameters(name):
+    print(f"copying {name} (this may take a few minutes)")
     src_cursor = src_conn.cursor()
     target_cursor = target_conn.cursor()
 
@@ -36,67 +40,108 @@ def copy_parameters(name):
         }
     }
 
-    src_cursor.execute("SELECT * FROM {} LEFT JOIN parameter on parameter_id = fk_parameter_id".format(name))
-    params = src_cursor.fetchall()
+    src_cursor.execute(f"SELECT COUNT(*) FROM {name};")
+    total = src_cursor.fetchone()[0]
 
-    for p in params:
-        statement = "INSERT INTO public.{}(parameter_id, type, name, description, last_update, domain, {}, " \
-                    "fk_parent_parameter_id, value_boolean, value_category, fk_unit_id, value_count, value_quantity, " \
-                    "value_text, value_xml, value_json, value_temporal_from, value_temporal_to) VALUES (nextval(" \
-                    "'parameter_seq'), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);".format(
-            cfg[name]["name"],
-            cfg[name]["key"]
-        )
 
-        target_cursor.execute(statement, (
-            p[3],  # type
-            p[4],  # name
-            "",  # description
-            p[5],  # last_update
-            p[6],  # domain
-            p[0],  # foreign key
-            None,  # parent parameter
-            p[7],  # value_boolean
-            p[8],  # value_category
-            p[9],  # fk_unit_id
-            p[10],  # value_count
-            p[11],  # value_quantity
-            p[12],  # value_text
-            p[13],  # value_xml
-            p[14],  # value_json
-            None,  # value_temporal_from
-            None,  # value_temporal_to
-        ))
-    target_conn.commit()
+    step_size = 1_000_000
+    for i in tqdm(range(0, total, step_size)):
+        src_cursor.execute(f"SELECT * FROM {name} LEFT JOIN parameter on parameter_id = fk_parameter_id")
+        params = src_cursor.fetchall()
+
+        for p in params:
+            statement = "INSERT INTO public.{}(parameter_id, type, name, description, last_update, domain, {}, " \
+                        "fk_parent_parameter_id, value_boolean, value_category, fk_unit_id, value_count, value_quantity, " \
+                        "value_text, value_xml, value_json, value_temporal_from, value_temporal_to) VALUES (nextval(" \
+                        "'parameter_seq'), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ORDER BY parameter_id OFFSET {} LIMIT {};".format(
+                cfg[name]["name"],
+                cfg[name]["key"],
+                i,
+                step_size
+            )
+
+            target_cursor.execute(statement, (
+                p[3],  # type
+                p[4],  # name
+                "",  # description
+                p[5],  # last_update
+                p[6],  # domain
+                p[0],  # foreign key
+                None,  # parent parameter
+                p[7],  # value_boolean
+                p[8],  # value_category
+                p[9],  # fk_unit_id
+                p[10],  # value_count
+                p[11],  # value_quantity
+                p[12],  # value_text
+                p[13],  # value_xml
+                p[14],  # value_json
+                None,  # value_temporal_from
+                None,  # value_temporal_to
+                None,  # fk_parent_parameter_id
+            ))
+        target_conn.commit()
 
 
 # Copies Observations in blocks of 100_000 entries.
 # Restores `fk_dataset_first_obs` & `fk_dataset_last_obs` Constraints on public.dataset as they are now fulfilled.
 def copy_observations(name):
+    print(f"copying observations (this may take a few minutes)")
     src_cursor = src_conn.cursor()
     target_cursor = target_conn.cursor()
 
     src_cursor.execute("SELECT COUNT(*) FROM public.observation;")
     total = src_cursor.fetchone()[0]
 
-    for i in range(0, total, 100000):
-        dump = io.StringIO()
+    # Drop all indices + constraints to speed up insertion
+    target_cursor.execute("DROP INDEX IF EXISTS idx_observation_dataset")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_observation_identifier_codespace")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_observation_is_deleted")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_observation_name_codespace")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_observation_parent")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_observation_result_template")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_observation_staidentifier")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_result_time")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_sampling_time_end")
+    target_cursor.execute("DROP INDEX IF EXISTS idx_sampling_time_start")
 
-        src_cursor.copy_expert("COPY (SELECT observation_id, value_type, fk_dataset_id, sampling_time_start, "
-                               "sampling_time_end, result_time, identifier, sta_identifier, "
-                               "fk_identifier_codespace_id, name, fk_name_codespace_id, description, is_deleted, "
-                               "valid_time_start, valid_time_end, sampling_geometry, value_identifier, value_name, "
-                               "value_description, vertical_from, vertical_to, fk_parent_observation_id, "
-                               "value_quantity, value_text, value_count, value_category, value_boolean, "
-                               "detection_limit_flag, detection_limit, value_reference, value_geometry, value_array, "
-                               "fk_result_template_id FROM public.observation LIMIT 100000 OFFSET {}) TO "
-                               "STDOUT".format(i), dump)
-        src_conn.commit()
-        dump.seek(0)
+    target_cursor.execute("ALTER TABLE public.observation DROP CONSTRAINT IF EXISTS fk_data_identifier_codesp")
+    target_cursor.execute("ALTER TABLE public.observation DROP CONSTRAINT IF EXISTS fk_data_name_codespace")
+    target_cursor.execute("ALTER TABLE public.observation DROP CONSTRAINT IF EXISTS fk_dataset")
+    target_cursor.execute("ALTER TABLE public.observation DROP CONSTRAINT IF EXISTS fk_parent_observation")
+    target_cursor.execute("ALTER TABLE public.observation DROP CONSTRAINT IF EXISTS fk_result_template")
 
-        target_cursor.copy_expert("COPY public.observation FROM STDIN", dump)
-        target_conn.commit()
+    target_cursor.execute("ALTER TABLE public.observation DROP CONSTRAINT IF EXISTS un_observation_identifier")
+    target_cursor.execute("ALTER TABLE public.observation DROP CONSTRAINT IF EXISTS un_observation_identity")
+    target_cursor.execute("ALTER TABLE public.observation DROP CONSTRAINT IF EXISTS un_observation_staidentifier")
 
+    step_size = 1_000_000
+    try:
+        for i in tqdm(range(0, total, step_size)):
+            print(f"copying observations {i} to {i+step_size}")
+            dump = io.StringIO()
+
+            src_cursor.copy_expert("COPY (SELECT observation_id, value_type, fk_dataset_id, sampling_time_start, "
+                                   "sampling_time_end, result_time, identifier, sta_identifier, "
+                                   "fk_identifier_codespace_id, name, fk_name_codespace_id, description, is_deleted, "
+                                   "valid_time_start, valid_time_end, sampling_geometry, value_identifier, value_name, "
+                                   "value_description, vertical_from, vertical_to, fk_parent_observation_id, "
+                                   "value_quantity, value_text, value_count, value_category, value_boolean, "
+                                   "detection_limit_flag, detection_limit, value_reference, value_geometry, value_array, "
+                                   "fk_result_template_id FROM public.observation ORDER BY observation_id LIMIT {} OFFSET {}) TO "
+                                   "STDOUT".format(step_size, i), dump)
+            src_conn.commit()
+            dump.seek(0)
+
+            target_cursor.copy_expert("COPY public.observation FROM STDIN", dump)
+            target_conn.commit()
+
+            dump.close()
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        exit(123)
+
+    print("restoring constraints on datasets")
     # Restore previously dropped constraints on datasets
     target_cursor.execute(
         "ALTER TABLE public.dataset ADD CONSTRAINT fk_dataset_first_obs FOREIGN KEY (fk_first_observation_id) "
@@ -105,11 +150,33 @@ def copy_observations(name):
         "ALTER TABLE public.dataset ADD CONSTRAINT fk_dataset_last_obs FOREIGN KEY (fk_last_observation_id) "
         "REFERENCES public.observation (observation_id) MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION")
 
+    print("restoring constraints on observations")
+    # Restore indices + constraints on observations
+    target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT un_observation_identifier UNIQUE (identifier);")
+    target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT un_observation_identity UNIQUE (value_type, fk_dataset_id, sampling_time_start, sampling_time_end, result_time, vertical_from, vertical_to);")
+    target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT un_observation_staidentifier UNIQUE (sta_identifier);")
+    target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT fk_data_identifier_codesp FOREIGN KEY (fk_identifier_codespace_id) REFERENCES public.codespace(codespace_id);")
+    target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT fk_data_name_codespace FOREIGN KEY (fk_name_codespace_id) REFERENCES public.codespace(codespace_id);")
+    target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT fk_dataset FOREIGN KEY (fk_dataset_id) REFERENCES public.dataset(dataset_id);")
+    target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT fk_parent_observation FOREIGN KEY (fk_parent_observation_id) REFERENCES public.observation(observation_id);")
+    target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT fk_result_template FOREIGN KEY (fk_result_template_id) REFERENCES public.result_template(result_template_id);")
+
+    print("restoring index idx_observation_is_deleted")
+    target_cursor.execute("CREATE INDEX idx_observation_is_deleted ON public.observation USING btree (is_deleted);")
+    print("restoring index idx_observation_staidentifier")
+    target_cursor.execute("CREATE INDEX idx_observation_staidentifier ON public.observation USING btree (sta_identifier);")
+    print("restoring index idx_result_time")
+    target_cursor.execute("CREATE INDEX idx_result_time ON public.observation USING btree (result_time);")
+    print("restoring index idx_sampling_time_end")
+    target_cursor.execute("CREATE INDEX idx_sampling_time_end ON public.observation USING btree (sampling_time_end);")
+    print("restoring index idx_sampling_time_start")
+    target_cursor.execute("CREATE INDEX idx_sampling_time_start ON public.observation USING btree (sampling_time_start);")
 
 # Merges public.dataset & public.datastream & public.datastream_dataset into single public.dataset
 # Refactors datastream into aggregate dataset.
 # Drops fk_dataset_first_obs` & `fk_dataset_last_obs` Constraints as they prevent insertion before observations are inserted
 def copy_dataset(name):
+    print(f"cloning {name}")
     src_cursor = src_conn.cursor()
     target_cursor = target_conn.cursor()
 
@@ -141,14 +208,12 @@ def copy_dataset(name):
     datastreams = src_cursor.fetchall()
 
     for d in datastreams:
-        print(d)
 
         # Get offering
-        src_cursor.execute(
-            "SELECT fk_offering_id from public.dataset "
-            "inner join public.datastream_dataset on dataset_id = fk_dataset_id where fk_datastream_id = {}".format(
-                d[0]))
-        fk_offering = src_cursor.fetchone()[0]
+        src_cursor.execute("SELECT offering_id FROM public.offering WHERE identifier IN ("
+                           "SELECT identifier FROM public.procedure where procedure_id = {})".format(d[12]))
+        datasets = src_cursor.fetchone()
+        fk_offering = datasets[0]
 
         target_cursor.execute("SELECT MAX(dataset_id)+1 FROM public.dataset")
         datastream_id = target_cursor.fetchone()[0]
@@ -170,18 +235,23 @@ def copy_dataset(name):
         # get all subdatasets
         src_cursor.execute(
             "SELECT fk_dataset_id from public.datastream_dataset where fk_datastream_id = {}".format(d[0]))
-        sub_dataset_ids = ",".join([str(x[0]) for x in src_cursor.fetchall()])
+        sub_dataset_ids = src_cursor.fetchall()
 
-        target_cursor.execute(
-            "UPDATE public.dataset SET fk_aggregation_id = {} WHERE dataset_id in ({})".format(
-                aggregation_id,
-                sub_dataset_ids)
-        )
+        if len(sub_dataset_ids) > 0:
+
+            target_cursor.execute(
+                "UPDATE public.dataset SET fk_aggregation_id = {} WHERE dataset_id in ({})".format(
+                    aggregation_id,
+                    ",".join([str(x[0]) for x in sub_dataset_ids]))
+            )
+            target_cursor.execute("UPDATE public.dataset SET fk_format_id = (SELECT fk_format_id FROM public.dataset WHERE dataset_id = '{}') WHERE sta_identifier = '{}'".format(sub_dataset_ids[0][0], d[14]))
+
         target_conn.commit()
 
 
 # Copies public.platform
 def copy_platform(name):
+    print(f"cloning {name}")
     dump = io.StringIO()
     src_cursor = src_conn.cursor()
     src_cursor.copy_expert(
@@ -218,6 +288,7 @@ def copy_location(name):
           "location",
           "COPY public.location(location_id, identifier, sta_identifier, name, description, location, "
           "geom, fk_format_id) TO STDOUT")
+    pass
 
 # Reorder sta_identifier column
 def copy_procedure(name):
@@ -228,6 +299,7 @@ def copy_procedure(name):
           "fk_format_id) TO STDOUT")
 
 def update_sequences():
+    print(f"updating sequences")
     target_cursor = target_conn.cursor()
     for seq in sequences:
         target_cursor.execute("select max({}) from {}".format(seq + "_id", seq))
@@ -243,6 +315,7 @@ def update_sequences():
 # Requires both tables to have the same column definitions
 def clone(src_table, target_table, src_copy="COPY {} TO STDOUT", target_copy="COPY {} FROM STDIN"):
     dump = io.StringIO()
+    print(f"cloning {src_table} to {target_table}")
 
     src_cursor = src_conn.cursor()
     src_cursor.copy_expert(src_copy.format(src_table), dump)
@@ -259,7 +332,7 @@ def clone(src_table, target_table, src_copy="COPY {} TO STDOUT", target_copy="CO
 
 # Truncates all tables in target_db.
 def truncate_tables():
-    print("Clearing target Database")
+    print("clearing target Database")
     cur = target_conn.cursor()
 
     # We have no "TRUNCATE ALL" so we generate individual statements
@@ -330,7 +403,7 @@ tables = {
     "thing_location": copy_thing_location,
 
     "observation_parameters": copy_parameters,
-    "platform_parameter": copy_parameters,
+    "platform_parameter": None,
     "feature_parameter": None,
     "location_parameter": None,
     "observation_parameter": None,
@@ -357,8 +430,8 @@ sequences = [
 def main():
     global DEBUG
 
-    src = os.getenv("SRC_DB", "host=localhost, dbname=sta user=postgres password=postgres port=5001")
-    target = os.getenv("TARGET_DB", "host=localhost, dbname=sta user=postgres password=postgres port=5000")
+    src = os.getenv("SRC_DB", "host=localhost, dbname=sws user=postgres password=postgres port=5001")
+    target = os.getenv("TARGET_DB", "host=localhost, dbname=latest user=postgres password=postgres port=5001")
     DEBUG = os.getenv("debug", "") != ""
 
     # Connect to databases
