@@ -2,8 +2,8 @@ import os
 import psycopg2 as psycopg
 import io
 import sys
+import time
 import traceback
-from tqdm import tqdm
 
 # database connections
 src_conn = None
@@ -45,7 +45,8 @@ def copy_parameters(name):
 
 
     step_size = 1_000_000
-    for i in tqdm(range(0, total, step_size)):
+    for i in range(0, total, step_size):
+        print(f"[{i}/{total}] copying parameters")
         src_cursor.execute(f"SELECT * FROM {name} LEFT JOIN parameter on parameter_id = fk_parameter_id")
         params = src_cursor.fetchall()
 
@@ -117,8 +118,8 @@ def copy_observations(name):
 
     step_size = 1_000_000
     try:
-        for i in tqdm(range(0, total, step_size)):
-            print(f"copying observations {i} to {i+step_size}")
+        for i in range(0, total, step_size):
+            print(f"[{i}/{total}] copying observations")
             dump = io.StringIO()
 
             src_cursor.copy_expert("COPY (SELECT observation_id, value_type, fk_dataset_id, sampling_time_start, "
@@ -141,6 +142,7 @@ def copy_observations(name):
         traceback.print_exc(file=sys.stdout)
         exit(123)
 
+    
     print("restoring constraints on datasets")
     # Restore previously dropped constraints on datasets
     target_cursor.execute(
@@ -150,7 +152,7 @@ def copy_observations(name):
         "ALTER TABLE public.dataset ADD CONSTRAINT fk_dataset_last_obs FOREIGN KEY (fk_last_observation_id) "
         "REFERENCES public.observation (observation_id) MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION")
 
-    print("restoring constraints on observations")
+    print("restoring constraints on observations (this may take a while)")
     # Restore indices + constraints on observations
     target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT un_observation_identifier UNIQUE (identifier);")
     target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT un_observation_identity UNIQUE (value_type, fk_dataset_id, sampling_time_start, sampling_time_end, result_time, vertical_from, vertical_to);")
@@ -161,15 +163,16 @@ def copy_observations(name):
     target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT fk_parent_observation FOREIGN KEY (fk_parent_observation_id) REFERENCES public.observation(observation_id);")
     target_cursor.execute("ALTER TABLE ONLY public.observation ADD CONSTRAINT fk_result_template FOREIGN KEY (fk_result_template_id) REFERENCES public.result_template(result_template_id);")
 
-    print("restoring index idx_observation_is_deleted")
+    print("restoring indices (this may take a while)")
+    print("[1/5] restoring index idx_observation_is_deleted")
     target_cursor.execute("CREATE INDEX idx_observation_is_deleted ON public.observation USING btree (is_deleted);")
-    print("restoring index idx_observation_staidentifier")
+    print("[2/5] restoring index idx_observation_staidentifier (this may take a while)")
     target_cursor.execute("CREATE INDEX idx_observation_staidentifier ON public.observation USING btree (sta_identifier);")
-    print("restoring index idx_result_time")
+    print("[3/5] restoring index idx_result_time")
     target_cursor.execute("CREATE INDEX idx_result_time ON public.observation USING btree (result_time);")
-    print("restoring index idx_sampling_time_end")
+    print("[4/5] restoring index idx_sampling_time_end")
     target_cursor.execute("CREATE INDEX idx_sampling_time_end ON public.observation USING btree (sampling_time_end);")
-    print("restoring index idx_sampling_time_start")
+    print("[5/5] restoring index idx_sampling_time_start")
     target_cursor.execute("CREATE INDEX idx_sampling_time_start ON public.observation USING btree (sampling_time_start);")
 
 # Merges public.dataset & public.datastream & public.datastream_dataset into single public.dataset
@@ -284,11 +287,32 @@ def copy_feature(name):
 
 # Reorder sta_identifier column
 def copy_location(name):
-    clone("location",
-          "location",
-          "COPY public.location(location_id, identifier, sta_identifier, name, description, location, "
-          "geom, fk_format_id) TO STDOUT")
-    pass
+    print("cloning locations (this may take a few minutes)")
+    target_cursor = target_conn.cursor()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT COUNT(*) FROM public.location;")
+    total = src_cursor.fetchone()[0]
+    
+    step_size = 1_000_000
+    try:
+        for i in range(0, total, step_size):
+            print(f"[{i}/{total}] copying locations")
+            dump = io.StringIO()
+
+            src_cursor.copy_expert("COPY (SELECT location_id, identifier, sta_identifier, name, description, location, "
+                                    "geom, fk_format_id from public.location ORDER BY location_id LIMIT {} OFFSET {}) TO STDOUT"
+                                    .format(step_size, i), dump)
+            src_conn.commit()
+            dump.seek(0)
+
+            target_cursor.copy_expert("COPY public.location FROM STDIN", dump)
+            target_conn.commit()
+
+            dump.close()
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        exit(123)
+    
 
 # Reorder sta_identifier column
 def copy_procedure(name):
@@ -443,16 +467,20 @@ def main():
         # Truncate target db
         truncate_tables()
 
+        start = time.time()
         # Copy tables
         for name in tables:
             if tables[name] is not None:
-                print("copying {}".format(name))
+                print("processing {}".format(name))
                 tables[name](name)
             else:
                 print("ignoring {}".format(name))
                 pass
         # Update sequences
         update_sequences()
+
+        print("TIME:")
+        print(time.time() - start)
 
 
 if __name__ == '__main__':
