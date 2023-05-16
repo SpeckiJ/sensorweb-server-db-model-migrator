@@ -4,6 +4,7 @@ import io
 import sys
 import time
 import traceback
+import uuid
 
 # database connections
 src_conn = None
@@ -22,12 +23,13 @@ def copy_verbatim(name):
 # Clones the `thing_location` table into `platform_location` (basically renaming the table)
 def copy_thing_location(name):
     if name == "thing_location":
-        clone("thing_location", "platform_location")
-    pass
+        clone(
+            "thing_location",
+            "platform_location",
+            "COPY public.thing_location(fk_thing_id, fk_location_id) TO STDOUT")
 
 
 # Copies parameters into their respective tables
-# in
 def copy_parameters(name):
     print(f"copying {name} (this may take a few minutes)")
     src_cursor = src_conn.cursor()
@@ -47,41 +49,19 @@ def copy_parameters(name):
     step_size = 1_000_000
     for i in range(0, total, step_size):
         print(f"[{i}/{total}] copying parameters")
-        src_cursor.execute(f"SELECT * FROM {name} LEFT JOIN parameter on parameter_id = fk_parameter_id")
-        params = src_cursor.fetchall()
+        
+        dump = io.StringIO()
+        stmnt = f"COPY (SELECT parameter_id, type, name, NULL, last_update, domain, {cfg[name]['key']}, " \
+                        " NULL, value_boolean, value_category, fk_unit_id, value_count, value_quantity, " \
+                        " value_text, value_xml, value_json, NULL, NULL " \
+                        f" FROM {name} JOIN parameter on parameter_id = fk_parameter_id ORDER BY parameter_id LIMIT {step_size} OFFSET {i}) TO STDOUT"
+        src_cursor.copy_expert(stmnt, dump)
+        src_conn.commit()
+        dump.seek(0)
 
-        for p in params:
-            statement = "INSERT INTO public.{}(parameter_id, type, name, description, last_update, domain, {}, " \
-                        "fk_parent_parameter_id, value_boolean, value_category, fk_unit_id, value_count, value_quantity, " \
-                        "value_text, value_xml, value_json, value_temporal_from, value_temporal_to) VALUES (nextval(" \
-                        "'parameter_seq'), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ORDER BY parameter_id OFFSET {} LIMIT {};".format(
-                cfg[name]["name"],
-                cfg[name]["key"],
-                i,
-                step_size
-            )
-
-            target_cursor.execute(statement, (
-                p[3],  # type
-                p[4],  # name
-                "",  # description
-                p[5],  # last_update
-                p[6],  # domain
-                p[0],  # foreign key
-                None,  # parent parameter
-                p[7],  # value_boolean
-                p[8],  # value_category
-                p[9],  # fk_unit_id
-                p[10],  # value_count
-                p[11],  # value_quantity
-                p[12],  # value_text
-                p[13],  # value_xml
-                p[14],  # value_json
-                None,  # value_temporal_from
-                None,  # value_temporal_to
-                None,  # fk_parent_parameter_id
-            ))
+        target_cursor.copy_expert(f"COPY public.{cfg[name]['name']} FROM STDIN", dump)
         target_conn.commit()
+        dump.close()
 
 
 # Copies Observations in blocks of 100_000 entries.
@@ -166,7 +146,7 @@ def copy_observations(name):
     print("restoring indices (this may take a while)")
     print("[1/5] restoring index idx_observation_is_deleted")
     target_cursor.execute("CREATE INDEX idx_observation_is_deleted ON public.observation USING btree (is_deleted);")
-    print("[2/5] restoring index idx_observation_staidentifier (this may take a while)")
+    print("[2/5] restoring index idx_observation_staidentifier")
     target_cursor.execute("CREATE INDEX idx_observation_staidentifier ON public.observation USING btree (sta_identifier);")
     print("[3/5] restoring index idx_result_time")
     target_cursor.execute("CREATE INDEX idx_result_time ON public.observation USING btree (result_time);")
@@ -353,6 +333,29 @@ def clone(src_table, target_table, src_copy="COPY {} TO STDOUT", target_copy="CO
     target_cursor.copy_expert(target_copy.format(target_table), dump)
     target_conn.commit()
 
+def fixup_trajectory_observations():
+    print("migrating trajectory observations")
+    target_cursor = target_conn.cursor()
+
+    target_cursor.execute("SELECT dataset_id from public.dataset where discriminator is null;")
+    dataset_ids = target_cursor.fetchall()
+    count = 0
+    for id in dataset_ids:
+        print(f"[{count} / {len(dataset_ids)}] migrating dataset {id[0]}")
+        identifier = str(uuid.uuid4())
+
+        insert = f"INSERT INTO public.observation(observation_id, value_type, fk_dataset_id, sampling_time_start, sampling_time_end, result_time, identifier, sta_identifier, fk_identifier_codespace_id, name, fk_name_codespace_id, description, is_deleted, valid_time_start, valid_time_end, sampling_geometry, value_identifier, value_name, value_description, vertical_from, vertical_to, fk_parent_observation_id, value_quantity, value_text, value_count, value_category, value_boolean, detection_limit_flag, detection_limit, value_reference, value_geometry, value_array, fk_result_template_id) VALUES (nextval('observation_seq'), 'trajectory', {id[0]}, '1970-01-01 00:00:01', '1970-01-01 00:00:01', null, '{identifier}', '{identifier}', null, null, null, null, 0, null, null, null, null, null, null, 0, 0, null, null, null, null, null, null, null, null, null, null, null, null);"
+        target_cursor.execute(insert)
+        
+        target_cursor.execute("SELECT MAX(observation_id) FROM public.observation;")
+        trajectory_obs_id = target_cursor.fetchone()[0]
+        
+        update = f"UPDATE public.observation SET fk_parent_observation_id={trajectory_obs_id} where fk_dataset_id={id[0]} and value_type='quantity'"
+        target_cursor.execute(update)
+
+        target_conn.commit()
+        
+        count += 1
 
 # Truncates all tables in target_db.
 def truncate_tables():
@@ -367,7 +370,6 @@ def truncate_tables():
             print(stmnt[0])
         cur.execute(stmnt[0])
     target_conn.commit()
-
 
 ## Hardcoded Table Names
 tables = {
@@ -426,7 +428,7 @@ tables = {
     "platform_location": copy_thing_location,
     "thing_location": copy_thing_location,
 
-    "observation_parameters": copy_parameters,
+    "observation_parameters": None,
     "platform_parameter": None,
     "feature_parameter": None,
     "location_parameter": None,
@@ -461,9 +463,13 @@ def main():
     # Connect to databases
     with psycopg.connect(src) as s, psycopg.connect(target) as t:
         global src_conn, target_conn
+        
         src_conn = s
         target_conn = t
-
+        
+        target_conn.set_session(autocommit=True)
+        src_conn.set_session(readonly=True)
+        
         # Truncate target db
         truncate_tables()
 
@@ -478,6 +484,9 @@ def main():
                 pass
         # Update sequences
         update_sequences()
+
+        # migrate trajectoryObservations
+        fixup_trajectory_observations()
 
         print("TIME:")
         print(time.time() - start)
